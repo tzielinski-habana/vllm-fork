@@ -235,12 +235,11 @@ def e2e_test():
     print(f"  Repeatability (batch=32, 3 runs): "
           f"avg={sum(repeat_times)/len(repeat_times):.1f} ms, "
           f"std={((sum((t - sum(repeat_times)/len(repeat_times))**2 for t in repeat_times) / len(repeat_times))**0.5):.1f} ms")
-    print(f"\n  {'Batch':>6} {'Pos':>4} {'Time (ms)':>10} {'tok/s':>8} {'Invariant'}")
-    print(f"  {'-'*6} {'-'*4} {'-'*10} {'-'*8} {'-'*9}")
+    print("\nBatch,Pos,Time (ms),tok/s,Invariant")
     for batch_size, pos, elapsed, match in perf_data:
         # Approximate: 64 tokens generated per prompt in batch
         tok_per_sec = (batch_size * 64) / (elapsed / 1000)
-        print(f"  {batch_size:>6} {pos:>4} {elapsed:>9.1f} {tok_per_sec:>7.1f} "
+        print(f"{batch_size},{pos},{elapsed:.1f},{tok_per_sec:.1f},"
               f"{'PASS' if match else 'FAIL'}")
 
     return all_pass

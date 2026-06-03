@@ -6,6 +6,7 @@ from collections.abc import Callable
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 
 import vllm.envs as envs
 from vllm.platforms import current_platform
@@ -38,7 +39,7 @@ def _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M):
     return pid_m, pid_n
 
 
-@triton.jit(launch_metadata=_matmul_launch_metadata)
+@triton.jit
 def matmul_kernel_persistent(
     a_ptr,
     b_ptr,
@@ -138,7 +139,11 @@ def matmul_persistent(
     assert bias is None or bias.dim() == 1, (
         "Currently assuming bias is 1D, let Horace know if you run into this"
     )
-    NUM_SMS = num_compute_units(a.device.index)
+    device_index = 0 if a.device.index is None else a.device.index
+    # In torch.compile mode on XPU, querying device properties can cause
+    # Dynamo to materialize non-literal XPU property objects. Use a stable
+    # upper bound for launch width; grid() already clamps by tile count.
+    NUM_SMS = 1024 if current_platform.is_xpu() else num_compute_units(device_index)
     M, K = a.shape
     K, N = b.shape
     dtype = a.dtype
@@ -586,52 +591,51 @@ def mean_dim(
 
 
 def mm_batch_invariant(a, b):
+    if a.device.type == "cpu":
+        return torch.mm(a, b)
     return matmul_persistent(a, b)
 
 
-def matmul_batch_invariant(a, b, *, out=None):
-    # torch.matmul can handle various dimensions
-    # For 2D x 2D, it's the same as mm
+def _linear_decomposed(input, weight, bias=None):
+    """aten::linear decomposed into mm+add for AutogradXPU.
+
+    By decomposing into aten::mm (which has a working backward that itself
+    decomposes into mm calls), we avoid the missing aten::linear_backward on XPU
+    while remaining fully torch.compile compatible.
+    """
+    out_features = weight.shape[0]
+    input_2d = input.reshape(-1, input.shape[-1])
+    output_2d = torch.mm(input_2d, weight.t())
+    output = output_2d.reshape(input.shape[:-1] + (out_features,))
+    if bias is not None:
+        output = output + bias
+    return output
+
+
+def _matmul_decomposed(a, b):
+    """aten::matmul decomposed into mm/bmm for AutogradXPU.
+
+    By decomposing into leaf ops (aten::mm, aten::bmm) whose backwards are
+    well-defined on XPU, we avoid the missing aten::matmul_backward.
+    """
     if a.ndim == 2 and b.ndim == 2:
-        result = matmul_persistent(a, b)
-        if out is not None:
-            out.copy_(result)
-            return out
-        return result
+        return torch.mm(a, b)
     elif b.ndim == 2:
-        # Handle ND x 2D: Common for linear layers
-        # (..., batch, seq, hidden) @ (hidden, out) -> (..., batch, seq, out)
         batch_dims = a.shape[:-1]
-        hidden = a.shape[-1]
-        out_dim = b.shape[-1]
-        a_2d = a.reshape(-1, hidden)
-        result_2d = matmul_persistent(a_2d, b)
-        result = result_2d.reshape(batch_dims + (out_dim,))
-        if out is not None:
-            out.copy_(result)
-            return out
-        return result
+        a_2d = a.reshape(-1, a.shape[-1])
+        result_2d = torch.mm(a_2d, b)
+        return result_2d.reshape(batch_dims + (b.shape[-1],))
     elif a.ndim >= 2 and b.ndim >= 3:
-        # Generic handler for 2D x ND and ND x ND (except 1D)
-        # Broadcast dims to ensure both matrices have the same shape
-        # If 2D x ND, then unsqueeze to add a dim to a
         if a.ndim == 2:
             a = a.unsqueeze(0)
         broadcast_shape = torch.broadcast_shapes(a.shape[:-2], b.shape[:-2])
         a = a.expand(broadcast_shape + a.shape[-2:])
         b = b.expand(broadcast_shape + b.shape[-2:])
         batch_dim = math.prod(broadcast_shape)
-        # Reuse broadcast shape to get all dims except mm dims
         a_3d = a.reshape(batch_dim, a.shape[-2], a.shape[-1])
         b_3d = b.reshape(batch_dim, b.shape[-2], b.shape[-1])
-        # Do batched matmul
-        result_3d = bmm_batch_invariant(a_3d, b_3d)
-        # Reshape back to [broadcast_shape, seq_a, seq_b]
-        result = result_3d.reshape(broadcast_shape + (a.shape[-2], b.shape[-1]))
-        if out is not None:
-            out.copy_(result)
-            return out
-        return result
+        result_3d = torch.bmm(a_3d, b_3d)
+        return result_3d.reshape(broadcast_shape + (a.shape[-2], b.shape[-1]))
     else:
         raise ValueError(
             f"matmul_batch_invariant requires both inputs be at least 2D "
@@ -639,7 +643,23 @@ def matmul_batch_invariant(a, b, *, out=None):
         )
 
 
+def matmul_batch_invariant(a, b, *, out=None):
+    """Public entry point for batch-invariant matmul.
+
+    Delegates to torch.matmul which dispatches through the aten dispatcher
+    to our AutogradXPU override.
+    """
+    return torch.matmul(a, b, out=out) if out is not None else torch.matmul(a, b)
+
+
 def bmm_batch_invariant(a, b, *, out=None):
+    if a.device.type == "cpu":
+        result = torch.bmm(a, b)
+        if out is not None:
+            out.copy_(result)
+            return out
+        return result
+
     # Batched matrix multiply: (B, M, K) x (B, K, N) -> (B, M, N)
     if not (a.ndim == 3 and b.ndim == 3):
         raise ValueError(
@@ -727,8 +747,17 @@ def bmm_batch_invariant(a, b, *, out=None):
     return c
 
 
-def addmm_batch_invariant(bias, a, b):
-    return matmul_persistent(a, b, bias=bias)
+def addmm_batch_invariant(bias, a, b, *, beta=1, alpha=1):
+    if a.device.type == "cpu":
+        return torch.addmm(bias, a, b, beta=beta, alpha=alpha)
+    result = matmul_persistent(a, b)
+    if alpha != 1:
+        result = result * alpha
+    if beta == 0:
+        return result
+    if beta != 1:
+        return result + beta * bias
+    return result + bias
 
 
 def _log_softmax_batch_invariant(input, dim, _half_to_float):
@@ -890,11 +919,12 @@ def rms_norm_batch_invariant(
 
 
 def linear_batch_invariant(input, weight, bias=None):
-    output = matmul_batch_invariant(input, weight.t())
+    """Public entry point for batch-invariant linear.
 
-    if bias is not None:
-        output = output + bias
-    return output
+    Delegates to F.linear which dispatches through the aten dispatcher
+    to our AutogradXPU override (on XPU) or our CUDA override.
+    """
+    return F.linear(input, weight, bias)
 
 
 _batch_invariant_MODE = False
@@ -902,12 +932,26 @@ _batch_invariant_LIB = None
 _fp16_block_size_n = 256
 
 
-def _register_matmul_overrides(lib, key: str):
-    """Register matmul overrides for batch invariance."""
+def _register_leaf_overrides(lib, key: str):
+    """Register leaf matmul ops at device dispatch key (e.g. XPU/CUDA).
+
+    These ops have well-defined backward decompositions in PyTorch's autograd
+    that re-use the same leaf ops, so no custom backward is needed.
+    """
     lib.impl("aten::mm", mm_batch_invariant, key)
     lib.impl("aten::addmm", addmm_batch_invariant, key)
-    lib.impl("aten::matmul", matmul_batch_invariant, key)
-    lib.impl("aten::linear", linear_batch_invariant, key)
+
+
+def _register_autograd_overrides(lib, key: str):
+    """Register composite ops at AutogradXPU dispatch key.
+
+    These decompose into leaf ops (mm, bmm) whose XPU overrides handle the
+    actual Triton kernel launch.  Registering at the Autograd level means:
+    - torch.compile sees standard aten nodes (shape inference works)
+    - Autograd records the sub-ops, so backward just calls aten::mm etc.
+    """
+    lib.impl("aten::linear", _linear_decomposed, key)
+    lib.impl("aten::matmul", _matmul_decomposed, key)
 
 
 def _register_common_overrides(lib, key: str):
@@ -935,8 +979,9 @@ def enable_batch_invariant_mode():
     if current_platform.is_cuda():
         if current_platform.is_device_capability_family(80):
             # SM80 (Ampere) cannot rely on cuBLASLt-only determinism; install the
-            # triton persistent matmul overrides for mm/addmm/matmul/linear.
-            _register_matmul_overrides(_batch_invariant_LIB, "CUDA")
+            # triton persistent matmul overrides for mm/addmm.
+            _register_leaf_overrides(_batch_invariant_LIB, "CUDA")
+            _register_autograd_overrides(_batch_invariant_LIB, "AutogradCUDA")
         else:
             # Hopper (SM90) and Blackwell (SM100): the only source of batch
             # variance is split-k, which we disable via the cuBLAS workspace
@@ -955,10 +1000,9 @@ def enable_batch_invariant_mode():
         # directly apply.  Use 128 as the safe default that works across all
         # Intel GPU variants (PVC, BMG, Arc).
         _fp16_block_size_n = 128
-        _register_matmul_overrides(_batch_invariant_LIB, "XPU")
+        _register_leaf_overrides(_batch_invariant_LIB, "XPU")
+        _register_autograd_overrides(_batch_invariant_LIB, "AutogradXPU")
         _register_common_overrides(_batch_invariant_LIB, "XPU")
-
-    torch.bmm = bmm_batch_invariant
 
     if current_platform.is_cuda():
         # Disable cuBLAS reduced-precision accumulation for determinism.

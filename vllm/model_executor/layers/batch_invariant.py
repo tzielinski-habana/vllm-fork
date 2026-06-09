@@ -941,8 +941,20 @@ def _linear_decomposed(input, weight, bias=None):
 
 
 def linear_batch_invariant(input, weight, bias=None):
-    """Public entry point — delegates through the dispatcher."""
-    return _linear_decomposed(input, weight, bias)
+    """Direct entry point from UnquantizedLinearMethod.apply().
+
+    Calls matmul_persistent directly (not through the dispatcher) so that
+    torch.compile/Inductor cannot replace the GEMM with a non-deterministic
+    kernel.  The separate _linear_decomposed function (registered at the
+    AutogradXPU dispatch key) uses torch.mm for the backward-pass path.
+    """
+    out_features = weight.shape[0]
+    input_2d = input.reshape(-1, input.shape[-1])
+    output_2d = matmul_persistent(input_2d, weight.t())
+    output = output_2d.reshape(input.shape[:-1] + (out_features,))
+    if bias is not None:
+        output = output + bias
+    return output
 
 
 _batch_invariant_MODE = False

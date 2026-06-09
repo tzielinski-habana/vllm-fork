@@ -943,11 +943,17 @@ def _linear_decomposed(input, weight, bias=None):
 def linear_batch_invariant(input, weight, bias=None):
     """Direct entry point from UnquantizedLinearMethod.apply().
 
-    Calls matmul_persistent directly (not through the dispatcher) so that
-    torch.compile/Inductor cannot replace the GEMM with a non-deterministic
-    kernel.  The separate _linear_decomposed function (registered at the
-    AutogradXPU dispatch key) uses torch.mm for the backward-pass path.
+    Two modes:
+    - Inference (no grad): calls matmul_persistent directly so that
+      torch.compile/Inductor cannot replace the GEMM with a
+      non-deterministic kernel.
+    - Training (grad enabled): uses torch.mm through the dispatcher so
+      autograd records leaf ops for the backward pass. The dispatcher
+      override (mm_batch_invariant) routes to our Triton kernel at
+      runtime.
     """
+    if input.requires_grad or weight.requires_grad:
+        return _linear_decomposed(input, weight, bias)
     out_features = weight.shape[0]
     input_2d = input.reshape(-1, input.shape[-1])
     output_2d = matmul_persistent(input_2d, weight.t())

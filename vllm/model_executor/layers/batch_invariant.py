@@ -129,15 +129,6 @@ def matmul_kernel_persistent(
         tl.store(c_ptrs, c, mask=c_mask)
 
 
-@torch.compiler.disable
-def _get_num_sms() -> int:
-    """Return the cached number of compute units, lazily initializing."""
-    global _NUM_SMS
-    if _NUM_SMS == 0:
-        _NUM_SMS = num_compute_units(0)
-    return _NUM_SMS
-
-
 def matmul_persistent(
     a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None = None
 ):
@@ -147,7 +138,11 @@ def matmul_persistent(
     assert bias is None or bias.dim() == 1, (
         "Currently assuming bias is 1D, let Horace know if you run into this"
     )
-    NUM_SMS = _get_num_sms()
+    # _NUM_SMS is set by enable_batch_invariant_mode() before torch.compile
+    # traces this function.  Dynamo lifts it as a compile-time constant.
+    # The fallback (num_compute_units) only runs in eager-mode tests that
+    # skip enable_batch_invariant_mode().
+    NUM_SMS = _NUM_SMS if _NUM_SMS > 0 else num_compute_units(0)
     M, K = a.shape
     K, N = b.shape
     dtype = a.dtype

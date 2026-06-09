@@ -138,7 +138,11 @@ def matmul_persistent(
     assert bias is None or bias.dim() == 1, (
         "Currently assuming bias is 1D, let Horace know if you run into this"
     )
-    NUM_SMS = num_compute_units(a.device.index)
+    # _NUM_SMS is set by enable_batch_invariant_mode() before torch.compile
+    # traces this function.  Dynamo lifts it as a compile-time constant.
+    # The fallback (num_compute_units) only runs in eager-mode tests that
+    # skip enable_batch_invariant_mode().
+    NUM_SMS = _NUM_SMS if _NUM_SMS > 0 else num_compute_units(0)
     M, K = a.shape
     K, N = b.shape
     dtype = a.dtype
@@ -937,13 +941,31 @@ def _linear_decomposed(input, weight, bias=None):
 
 
 def linear_batch_invariant(input, weight, bias=None):
-    """Public entry point — delegates through the dispatcher."""
-    return _linear_decomposed(input, weight, bias)
+    """Direct entry point from UnquantizedLinearMethod.apply().
+
+    Two modes:
+    - Inference (no grad): calls matmul_persistent directly so that
+      torch.compile/Inductor cannot replace the GEMM with a
+      non-deterministic kernel.
+    - Training (grad enabled): uses _linear_decomposed which calls
+      torch.mm through the dispatcher so autograd records leaf ops
+      for the backward pass.
+    """
+    if input.requires_grad or weight.requires_grad:
+        return _linear_decomposed(input, weight, bias)
+    out_features = weight.shape[0]
+    input_2d = input.reshape(-1, input.shape[-1])
+    output_2d = matmul_persistent(input_2d, weight.t())
+    output = output_2d.reshape(input.shape[:-1] + (out_features,))
+    if bias is not None:
+        output = output + bias
+    return output
 
 
 _batch_invariant_MODE = False
 _batch_invariant_LIB = None
 _fp16_block_size_n = 256
+_NUM_SMS: int = 0
 
 
 def _register_leaf_overrides(lib, key: str):
@@ -982,12 +1004,13 @@ def _register_common_overrides(lib, key: str):
 
 def enable_batch_invariant_mode():
     global _batch_invariant_MODE, _batch_invariant_LIB
-    global _fp16_block_size_n
+    global _fp16_block_size_n, _NUM_SMS
 
     if _batch_invariant_MODE:
         return
 
     _batch_invariant_MODE = True
+    _NUM_SMS = num_compute_units(0)
     _batch_invariant_LIB = torch.library.Library("aten", "IMPL")
 
     if current_platform.is_cuda():

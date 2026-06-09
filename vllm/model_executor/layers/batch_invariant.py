@@ -593,6 +593,37 @@ def mm_batch_invariant(a, b):
     return matmul_persistent(a, b)
 
 
+def _matmul_decomposed(a, b):
+    """Decompose aten::matmul into aten::mm/aten::bmm for AutogradXPU.
+
+    Each sub-call (torch.mm, torch.bmm) re-enters the dispatcher, hits our
+    "XPU" overrides, and gets recorded individually by autograd.
+    """
+    if a.ndim == 2 and b.ndim == 2:
+        return torch.mm(a, b)
+    elif b.ndim == 2:
+        batch_dims = a.shape[:-1]
+        a_2d = a.reshape(-1, a.shape[-1])
+        result_2d = torch.mm(a_2d, b)
+        return result_2d.reshape(batch_dims + (b.shape[-1],))
+    elif a.ndim >= 2 and b.ndim >= 3:
+        if a.ndim == 2:
+            a = a.unsqueeze(0)
+        broadcast_shape = torch.broadcast_shapes(a.shape[:-2], b.shape[:-2])
+        a = a.expand(broadcast_shape + a.shape[-2:])
+        b = b.expand(broadcast_shape + b.shape[-2:])
+        batch_dim = math.prod(broadcast_shape)
+        a_3d = a.reshape(batch_dim, a.shape[-2], a.shape[-1])
+        b_3d = b.reshape(batch_dim, b.shape[-2], b.shape[-1])
+        result_3d = torch.bmm(a_3d, b_3d)
+        return result_3d.reshape(broadcast_shape + (a.shape[-2], b.shape[-1]))
+    else:
+        raise ValueError(
+            f"matmul_batch_invariant requires both inputs be at least 2D "
+            f"got shapes {a.shape} and {b.shape}"
+        )
+
+
 def matmul_batch_invariant(a, b, *, out=None):
     # torch.matmul can handle various dimensions
     # For 2D x 2D, it's the same as mm
@@ -893,12 +924,25 @@ def rms_norm_batch_invariant(
     return rms_norm(input, weight, eps=eps)
 
 
-def linear_batch_invariant(input, weight, bias=None):
-    output = matmul_batch_invariant(input, weight.t())
+def _linear_decomposed(input, weight, bias=None):
+    """Decompose aten::linear into aten::mm + add for AutogradXPU.
 
+    By calling torch.mm (which re-enters the dispatcher and hits our "XPU"
+    override), autograd records mm ops on the tape. The backward for mm is
+    just more mm calls — no linear_backward needed.
+    """
+    out_features = weight.shape[0]
+    input_2d = input.reshape(-1, input.shape[-1])
+    output_2d = torch.mm(input_2d, weight.t())
+    output = output_2d.reshape(input.shape[:-1] + (out_features,))
     if bias is not None:
         output = output + bias
     return output
+
+
+def linear_batch_invariant(input, weight, bias=None):
+    """Public entry point — delegates through the dispatcher."""
+    return _linear_decomposed(input, weight, bias)
 
 
 _batch_invariant_MODE = False
@@ -907,12 +951,26 @@ _fp16_block_size_n = 256
 _NUM_SMS: int = 0
 
 
-def _register_matmul_overrides(lib, key: str):
-    """Register matmul overrides for batch invariance."""
+def _register_leaf_overrides(lib, key: str):
+    """Register leaf matmul ops at device dispatch key (e.g. "XPU"/"CUDA").
+
+    These ops (mm, addmm) have well-defined backward decompositions in
+    PyTorch's autograd that re-use the same leaf ops, so no custom backward
+    is needed.
+    """
     lib.impl("aten::mm", mm_batch_invariant, key)
     lib.impl("aten::addmm", addmm_batch_invariant, key)
-    lib.impl("aten::matmul", matmul_batch_invariant, key)
-    lib.impl("aten::linear", linear_batch_invariant, key)
+
+
+def _register_autograd_overrides(lib, key: str):
+    """Register composite ops at Autograd dispatch key (e.g. "AutogradXPU").
+
+    These decompose into leaf ops (mm, bmm) whose device-level overrides
+    handle the actual Triton kernel launch. Registering at the Autograd level
+    means autograd records the sub-ops, so backward just calls mm/bmm again.
+    """
+    lib.impl("aten::linear", _linear_decomposed, key)
+    lib.impl("aten::matmul", _matmul_decomposed, key)
 
 
 def _register_common_overrides(lib, key: str):
@@ -941,8 +999,9 @@ def enable_batch_invariant_mode():
     if current_platform.is_cuda():
         if current_platform.is_device_capability_family(80):
             # SM80 (Ampere) cannot rely on cuBLASLt-only determinism; install the
-            # triton persistent matmul overrides for mm/addmm/matmul/linear.
-            _register_matmul_overrides(_batch_invariant_LIB, "CUDA")
+            # triton persistent matmul overrides for mm/addmm.
+            _register_leaf_overrides(_batch_invariant_LIB, "CUDA")
+            _register_autograd_overrides(_batch_invariant_LIB, "AutogradCUDA")
         else:
             # Hopper (SM90) and Blackwell (SM100): the only source of batch
             # variance is split-k, which we disable via the cuBLAS workspace
@@ -961,7 +1020,8 @@ def enable_batch_invariant_mode():
         # directly apply.  Use 128 as the safe default that works across all
         # Intel GPU variants (PVC, BMG, Arc).
         _fp16_block_size_n = 128
-        _register_matmul_overrides(_batch_invariant_LIB, "XPU")
+        _register_leaf_overrides(_batch_invariant_LIB, "XPU")
+        _register_autograd_overrides(_batch_invariant_LIB, "AutogradXPU")
         _register_common_overrides(_batch_invariant_LIB, "XPU")
 
     torch.bmm = bmm_batch_invariant

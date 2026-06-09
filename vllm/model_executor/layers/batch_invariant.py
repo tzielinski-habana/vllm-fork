@@ -129,6 +129,15 @@ def matmul_kernel_persistent(
         tl.store(c_ptrs, c, mask=c_mask)
 
 
+@torch.compiler.disable
+def _get_num_sms() -> int:
+    """Return the cached number of compute units, lazily initializing."""
+    global _NUM_SMS
+    if _NUM_SMS == 0:
+        _NUM_SMS = num_compute_units(0)
+    return _NUM_SMS
+
+
 def matmul_persistent(
     a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None = None
 ):
@@ -138,7 +147,7 @@ def matmul_persistent(
     assert bias is None or bias.dim() == 1, (
         "Currently assuming bias is 1D, let Horace know if you run into this"
     )
-    NUM_SMS = num_compute_units(a.device.index)
+    NUM_SMS = _get_num_sms()
     M, K = a.shape
     K, N = b.shape
     dtype = a.dtype
@@ -900,6 +909,7 @@ def linear_batch_invariant(input, weight, bias=None):
 _batch_invariant_MODE = False
 _batch_invariant_LIB = None
 _fp16_block_size_n = 256
+_NUM_SMS: int = 0
 
 
 def _register_matmul_overrides(lib, key: str):
@@ -924,12 +934,13 @@ def _register_common_overrides(lib, key: str):
 
 def enable_batch_invariant_mode():
     global _batch_invariant_MODE, _batch_invariant_LIB
-    global _fp16_block_size_n
+    global _fp16_block_size_n, _NUM_SMS
 
     if _batch_invariant_MODE:
         return
 
     _batch_invariant_MODE = True
+    _NUM_SMS = num_compute_units(0)
     _batch_invariant_LIB = torch.library.Library("aten", "IMPL")
 
     if current_platform.is_cuda():

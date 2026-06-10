@@ -214,9 +214,10 @@ def matmul_kernel_descriptor_persistent(
         c_desc.store([offs_cm, offs_cn], c)
 
 
+@torch.library.custom_op("vllm::matmul_descriptor_persistent", mutates_args=())
 def matmul_descriptor_persistent(
     a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None = None
-):
+) -> torch.Tensor:
     """Persistent matmul using tensor descriptors (Intel XPU fast path).
 
     Args:
@@ -296,6 +297,15 @@ def matmul_descriptor_persistent(
         **configs[dtype],
     )
     return c
+
+
+@matmul_descriptor_persistent.register_fake
+def _matmul_descriptor_persistent_fake(
+    a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None = None
+) -> torch.Tensor:
+    M = a.shape[0]
+    N = b.shape[1]
+    return torch.empty((M, N), device=a.device, dtype=a.dtype)
 
 
 def matmul_persistent(

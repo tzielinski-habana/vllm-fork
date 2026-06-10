@@ -241,13 +241,11 @@ def matmul_descriptor_persistent(
     b_t = b.t().contiguous()
 
     c = torch.empty((M, N), device=a.device, dtype=dtype)
-    NUM_SMS = num_compute_units(a.device.index)
-
-    # Tensor descriptors need a global-memory allocator.
-    def alloc_fn(size: int, alignment: int, stream: int | None):
-        return torch.empty(size, device=a.device, dtype=torch.int8)
-
-    triton.set_allocator(alloc_fn)
+    # _NUM_SMS is set by enable_batch_invariant_mode() before torch.compile
+    # traces this function.  Dynamo lifts it as a compile-time constant.
+    # The fallback (num_compute_units) only runs in eager-mode tests that
+    # skip enable_batch_invariant_mode().
+    NUM_SMS = _NUM_SMS if _NUM_SMS > 0 else num_compute_units(0)
 
     def grid(META):
         return (
@@ -1200,6 +1198,13 @@ def enable_batch_invariant_mode():
     _batch_invariant_MODE = True
     _NUM_SMS = num_compute_units(0)
     _batch_invariant_LIB = torch.library.Library("aten", "IMPL")
+
+    # Tensor descriptors need a global-memory allocator; must be set outside
+    # torch.compile regions (triton.set_allocator modifies global state).
+    def _triton_alloc_fn(size: int, alignment: int, stream: int | None):
+        return torch.empty(size, device="xpu", dtype=torch.int8)
+
+    triton.set_allocator(_triton_alloc_fn)
 
     if current_platform.is_cuda():
         if current_platform.is_device_capability_family(80):

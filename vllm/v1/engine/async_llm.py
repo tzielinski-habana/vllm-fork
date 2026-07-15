@@ -1109,3 +1109,7 @@ class AsyncLLM(EngineClient):
     async def finish_weight_update(self) -> None:
         """Finish the current weight update."""
         await self.collective_rpc("finish_weight_update")
+
+    async def close_weight_transfer_engine(self) -> None:
+        """Close the weight transfer engine (TRL-compatible cleanup)."""
+        await self.collective_rpc("close_weight_transfer_engine")

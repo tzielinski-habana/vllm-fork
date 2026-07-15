@@ -124,3 +124,15 @@ WeightTransferEngineFactory.register_engine(
     "vllm.distributed.weight_transfer.ipc_engine",
     "IPCWeightTransferEngine",
 )
+
+WeightTransferEngineFactory.register_engine(
+    "sparse_nccl",
+    "vllm.distributed.weight_transfer.sparse_nccl_engine",
+    "SparseNCCLWeightTransferEngine",
+)
+
+WeightTransferEngineFactory.register_engine(
+    "xccl",
+    "vllm.distributed.weight_transfer.xccl_engine",
+    "XCCLWeightTransferEngine",
+)

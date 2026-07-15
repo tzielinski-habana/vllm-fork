@@ -1004,10 +1004,28 @@ class Worker(WorkerBase):
         """
         Initialize weight transfer mechanism.
         For NCCL backend, this creates a process group with the trainer.
+        For XCCL (TRL-compatible), dynamically creates the engine if not configured.
 
         Args:
             init_info: Dictionary containing backend-specific initialization info
         """
+        # Lazily create XCCL engine for TRL-compatible flow if no engine is
+        # pre-configured. This allows TRL's init_communicator to work without
+        # requiring --weight-transfer-backend in the vllm serve command.
+        if self.weight_transfer_engine is None and "host" in init_info:
+            from vllm.config.weight_transfer import WeightTransferConfig
+            from vllm.distributed.weight_transfer.xccl_engine import (
+                XCCLWeightTransferEngine,
+            )
+
+            config = WeightTransferConfig(backend="xccl")
+            self.weight_transfer_engine = XCCLWeightTransferEngine(
+                config=config,
+                vllm_config=self.vllm_config,
+                device=self.device,
+                model=self.model_runner.get_model(),
+            )
+
         self._check_weight_transfer_engine()
         assert self.weight_transfer_engine is not None
         # Parse dict into backend-specific typed dataclass
@@ -1047,8 +1065,11 @@ class Worker(WorkerBase):
         """
         Receive one weight update chunk from the trainer.
 
-        start_weight_update must be called before update_weights and
-        finish_weight_update must be called after all chunks have been sent.
+        For the new-style API: start_weight_update must be called before
+        update_weights and finish_weight_update must be called after all chunks.
+
+        For TRL-compatible mode (per-param updates via /update_named_param/):
+        auto-starts and auto-finishes the weight update session.
 
         Args:
             update_info: Dictionary containing backend-specific update info
@@ -1056,10 +1077,11 @@ class Worker(WorkerBase):
         self._check_weight_transfer_engine()
         assert self.weight_transfer_engine is not None
 
-        if not self._weight_update_active:
-            raise RuntimeError(
-                "start_weight_update must be called before update_weights."
-            )
+        # TRL-compatible mode: auto-manage weight update lifecycle per param
+        is_trl_single_param = "name" in update_info and not self._weight_update_active
+        if is_trl_single_param:
+            self.weight_transfer_engine.start_weight_update()
+            self._weight_update_active = True
 
         update_succeeded = False
         try:
@@ -1117,6 +1139,10 @@ class Worker(WorkerBase):
                 self._weight_update_active = False
                 self._is_checkpoint_format = True
 
+        if is_trl_single_param:
+            self.weight_transfer_engine.finish_weight_update()
+            self._weight_update_active = False
+
     def finish_weight_update(self) -> None:
         """Finish the current weight update session."""
         self._check_weight_transfer_engine()
@@ -1137,6 +1163,19 @@ class Worker(WorkerBase):
 
         self._weight_update_active = False
         self._is_checkpoint_format = True
+
+    def close_weight_transfer_engine(self) -> None:
+        """Close the weight transfer engine and release resources.
+
+        Called by TRL's close_communicator endpoint to tear down the
+        XCCL/NCCL process group after training completes.
+        """
+        if self.weight_transfer_engine is not None:
+            if hasattr(self.weight_transfer_engine, "close"):
+                self.weight_transfer_engine.close()
+            self.weight_transfer_engine.shutdown()
+            self.weight_transfer_engine = None
+        self._weight_update_active = False
 
     def shutdown(self) -> None:
         gc.unfreeze()

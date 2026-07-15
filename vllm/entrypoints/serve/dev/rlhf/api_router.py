@@ -184,5 +184,112 @@ async def get_world_size(
     return JSONResponse(content={"world_size": world_size})
 
 
+###############################################################################
+# TRL-compatible endpoints (old-style weight sync via ProcessGroupXCCL/NCCL)
+#
+# These endpoints support TRL's VLLMClient.init_communicator() / update_named_param()
+# protocol used in GRPOTrainer server mode.
+###############################################################################
+
+
+@router.get("/get_world_size/")
+async def get_world_size_trl(raw_request: Request):
+    """TRL-compatible endpoint (trailing slash). Returns world size for weight sync."""
+    parallel_config = engine_client(raw_request).vllm_config.parallel_config
+    world_size = parallel_config.world_size_across_dp
+    return JSONResponse(content={"world_size": world_size})
+
+
+@router.post("/init_communicator/")
+async def init_communicator(raw_request: Request):
+    """Initialize XCCL/NCCL weight sync communicator for TRL server mode.
+
+    Expected JSON body from TRL:
+        {"host": "0.0.0.0", "port": 12345, "world_size": 2, "client_device_uuid": "..."}
+    """
+    try:
+        body = await raw_request.json()
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=400, detail="Invalid JSON format") from e
+
+    host = body.get("host", "0.0.0.0")
+    port = body.get("port")
+    world_size = body.get("world_size")
+    client_device_uuid = body.get("client_device_uuid", "")
+
+    if port is None or world_size is None:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail="Missing 'port' or 'world_size' in request body",
+        )
+
+    from vllm.distributed.weight_transfer.xccl_engine import (
+        XCCLWeightTransferInitInfo,
+    )
+
+    init_info = XCCLWeightTransferInitInfo(
+        host=host,
+        port=port,
+        world_size=world_size,
+        client_device_uuid=client_device_uuid,
+    )
+
+    await engine_client(raw_request).collective_rpc(
+        "init_weight_transfer_engine",
+        kwargs={"init_info": init_info.__dict__},
+    )
+
+    return JSONResponse(content={"status": "ok"})
+
+
+@router.post("/update_named_param/")
+async def update_named_param(raw_request: Request):
+    """Receive a single parameter update via XCCL broadcast from TRL.
+
+    Expected JSON body from TRL:
+        {"name": "model.layers.0.self_attn.q_proj.weight",
+         "dtype": "torch.bfloat16", "shape": [4096, 4096]}
+    """
+    try:
+        body = await raw_request.json()
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=400, detail="Invalid JSON format") from e
+
+    name = body.get("name")
+    dtype = body.get("dtype")
+    shape = body.get("shape")
+
+    if name is None or dtype is None or shape is None:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail="Missing 'name', 'dtype', or 'shape' in request body",
+        )
+
+    await engine_client(raw_request).collective_rpc(
+        "update_weights",
+        kwargs={"update_info": {"name": name, "dtype": dtype, "shape": shape}},
+    )
+
+    return JSONResponse(content={"status": "ok"})
+
+
+@router.post("/close_communicator/")
+async def close_communicator(raw_request: Request):
+    """Close the weight sync communicator and clean up resources."""
+    await engine_client(raw_request).collective_rpc("close_weight_transfer_engine")
+    return JSONResponse(content={"status": "ok"})
+
+
+@router.post("/reset_prefix_cache/")
+async def reset_prefix_cache(raw_request: Request):
+    """Reset the prefix cache (called by TRL after weight updates)."""
+    engine = engine_client(raw_request)
+    try:
+        await engine.reset_prefix_cache()
+    except AttributeError:
+        pass  # Not all engine implementations support this
+    return JSONResponse(content={"status": "ok"})
+
+
 def attach_router(app: FastAPI):
     app.include_router(router)

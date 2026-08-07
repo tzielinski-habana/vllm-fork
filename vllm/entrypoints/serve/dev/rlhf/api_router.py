@@ -246,10 +246,17 @@ async def init_communicator(raw_request: Request):
 async def update_named_param(raw_request: Request):
     """Receive a single parameter update via XCCL broadcast from TRL.
 
+    TRL waits for the 200 response BEFORE it broadcasts the tensor via XCCL.
+    Therefore, we must return 200 first, then receive the broadcast in
+    a background task. The next /update_named_param/ call will implicitly
+    wait for the previous one to complete via the engine's collective_rpc lock.
+
     Expected JSON body from TRL:
         {"name": "model.layers.0.self_attn.q_proj.weight",
          "dtype": "torch.bfloat16", "shape": [4096, 4096]}
     """
+    import asyncio
+
     try:
         body = await raw_request.json()
     except json.JSONDecodeError as e:
@@ -265,9 +272,13 @@ async def update_named_param(raw_request: Request):
             detail="Missing 'name', 'dtype', or 'shape' in request body",
         )
 
-    await engine_client(raw_request).collective_rpc(
-        "update_weights",
-        kwargs={"update_info": {"name": name, "dtype": dtype, "shape": shape}},
+    # Schedule the weight receive in the background — TRL broadcasts AFTER
+    # getting the 200 response, so we must not block here.
+    asyncio.ensure_future(
+        engine_client(raw_request).collective_rpc(
+            "update_weights",
+            kwargs={"update_info": {"name": name, "dtype": dtype, "shape": shape}},
+        )
     )
 
     return JSONResponse(content={"status": "ok"})
@@ -283,11 +294,11 @@ async def close_communicator(raw_request: Request):
 @router.post("/reset_prefix_cache/")
 async def reset_prefix_cache(raw_request: Request):
     """Reset the prefix cache (called by TRL after weight updates)."""
+    import contextlib
+
     engine = engine_client(raw_request)
-    try:
+    with contextlib.suppress(AttributeError):
         await engine.reset_prefix_cache()
-    except AttributeError:
-        pass  # Not all engine implementations support this
     return JSONResponse(content={"status": "ok"})
 
 

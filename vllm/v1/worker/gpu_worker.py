@@ -1021,8 +1021,7 @@ class Worker(WorkerBase):
             config = WeightTransferConfig(backend="xccl")
             self.weight_transfer_engine = XCCLWeightTransferEngine(
                 config=config,
-                vllm_config=self.vllm_config,
-                device=self.device,
+                parallel_config=self.vllm_config.parallel_config,
                 model=self.model_runner.get_model(),
             )
 
@@ -1080,8 +1079,7 @@ class Worker(WorkerBase):
         # TRL-compatible mode: auto-manage weight update lifecycle per param
         is_trl_single_param = "name" in update_info and not self._weight_update_active
         if is_trl_single_param:
-            self.weight_transfer_engine.start_weight_update()
-            self._weight_update_active = True
+            self.start_weight_update()
 
         update_succeeded = False
         try:
@@ -1140,8 +1138,7 @@ class Worker(WorkerBase):
                 self._is_checkpoint_format = True
 
         if is_trl_single_param:
-            self.weight_transfer_engine.finish_weight_update()
-            self._weight_update_active = False
+            self.finish_weight_update()
 
     def finish_weight_update(self) -> None:
         """Finish the current weight update session."""

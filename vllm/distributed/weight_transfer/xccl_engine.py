@@ -89,6 +89,7 @@ def worker_init_xccl_process_group(
         port=init_info.port,
         world_size=init_info.world_size,
         is_master=(worker_rank == 0),
+        wait_for_workers=False,
     )
     prefixed_store = c10d.PrefixStore("client2server", store)
     xccl_options = c10d.ProcessGroupXCCL.Options()

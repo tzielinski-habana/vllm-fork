@@ -234,9 +234,15 @@ async def init_communicator(raw_request: Request):
         client_device_uuid=client_device_uuid,
     )
 
-    await engine_client(raw_request).collective_rpc(
-        "init_weight_transfer_engine",
-        kwargs={"init_info": init_info.__dict__},
+    # Fire-and-forget: ProcessGroupGloo blocks until all ranks join,
+    # but TRL only creates its rank AFTER getting the 200 response.
+    import asyncio
+
+    asyncio.ensure_future(
+        engine_client(raw_request).collective_rpc(
+            "init_weight_transfer_engine",
+            kwargs={"init_info": init_info.__dict__},
+        )
     )
 
     return JSONResponse(content={"status": "ok"})

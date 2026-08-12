@@ -92,12 +92,12 @@ def worker_init_xccl_process_group(
         wait_for_workers=False,
     )
     prefixed_store = c10d.PrefixStore("client2server", store)
-    xccl_options = c10d.ProcessGroupXCCL.Options()
-    pg = c10d.ProcessGroupXCCL(
-        store=prefixed_store,
-        rank=worker_rank,
-        size=init_info.world_size,
-        options=xccl_options,
+    # Use Gloo backend (CPU-based TCP transport) instead of XCCL.
+    # XCCL cross-process broadcast is broken on current oneCCL/L0 stack.
+    pg = c10d.ProcessGroupGloo(
+        prefixed_store,
+        worker_rank,
+        init_info.world_size,
     )
     return pg
 
@@ -163,14 +163,14 @@ class XCCLWeightTransferEngine(
             )
 
         dtype = getattr(torch, update_info.dtype.removeprefix("torch."))
-        weight = torch.empty(update_info.shape, dtype=dtype, device=self._device)
+        # Gloo operates on CPU tensors only
+        weight = torch.empty(update_info.shape, dtype=dtype, device="cpu")
 
         # Receive broadcast from TRL client (root = client rank)
         self.model_update_group.broadcast(weight, root=self._client_rank)
-        self.model_update_group.barrier()
 
-        # Load into model
-        load_weights([(update_info.name, weight)])
+        # Move to XPU and load into model
+        load_weights([(update_info.name, weight.to(self._device))])
         del weight
 
     def close(self) -> None:

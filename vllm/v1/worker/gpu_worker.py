@@ -1079,7 +1079,9 @@ class Worker(WorkerBase):
         # TRL-compatible mode: auto-manage weight update lifecycle per param
         is_trl_single_param = "name" in update_info and not self._weight_update_active
         if is_trl_single_param:
-            self.start_weight_update()
+            # Use non-checkpoint format for TRL: direct param copy, no layerwise reload.
+            # TRL sends individual HF-named params which don't match vLLM's packed layout.
+            self.start_weight_update(is_checkpoint_format=False)
 
         update_succeeded = False
         try:

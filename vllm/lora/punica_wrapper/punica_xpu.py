@@ -104,7 +104,14 @@ class PunicaWrapperXPU(PunicaWrapperBase):
             dtype=x.dtype,
             device=x.device,
         )
-        bgmv_shrink(x, w_t_all, buf, self._get_token_lora_indices(x), scale)
+        bgmv_shrink(
+            x,
+            w_t_all,
+            buf,
+            self._get_token_lora_indices(x),
+            scale,
+            no_lora_flag_cpu=self.token_mapping_meta.no_lora_flag_cpu,
+        )
         y.copy_(buf)
 
     def _apply_expand(
@@ -126,7 +133,14 @@ class PunicaWrapperXPU(PunicaWrapperBase):
         if x.size(1) != rank:
             x = x[:, :rank].contiguous()
         bgmv_expand_slice(
-            x, w_t_all, y, token_lora_indices, y_offset, y_slice_size, add_inputs
+            x,
+            w_t_all,
+            y,
+            token_lora_indices,
+            y_offset,
+            y_slice_size,
+            add_inputs,
+            no_lora_flag_cpu=self.token_mapping_meta.no_lora_flag_cpu,
         )
 
     def add_shrink(
@@ -221,7 +235,14 @@ class PunicaWrapperXPU(PunicaWrapperBase):
             add_inputs (bool): Default to True.
         """
         token_lora_indices = self._get_token_lora_indices(x)
-        bgmv_expand(x, lora_b_stacked, y, token_lora_indices, add_inputs)
+        bgmv_expand(
+            x,
+            lora_b_stacked,
+            y,
+            token_lora_indices,
+            add_inputs,
+            no_lora_flag_cpu=self.token_mapping_meta.no_lora_flag_cpu,
+        )
 
     def add_lora_linear(
         self,
@@ -327,10 +348,25 @@ class PunicaWrapperXPU(PunicaWrapperBase):
             "To minimize overhead, the buffer should be created by "
             ".add_lora_linear() instead of being passed in."
         )
+        no_lora_flag_cpu = self.prompt_mapping_meta.no_lora_flag_cpu
         buffer = torch.zeros((x.size(0), r), dtype=x.dtype, device=x.device)
         sampler_indices = torch.narrow(self._sampler_indices, 0, 0, x.size(0))
-        bgmv_shrink(x, lora_a_stacked, buffer, sampler_indices, scale)
-        bgmv_expand(buffer, lora_b_stacked, y, sampler_indices, add_inputs=True)
+        bgmv_shrink(
+            x,
+            lora_a_stacked,
+            buffer,
+            sampler_indices,
+            scale,
+            no_lora_flag_cpu=no_lora_flag_cpu,
+        )
+        bgmv_expand(
+            buffer,
+            lora_b_stacked,
+            y,
+            sampler_indices,
+            add_inputs=True,
+            no_lora_flag_cpu=no_lora_flag_cpu,
+        )
         y = y.view_as(y_org)
 
     def moe_lora_align_block_size(

@@ -296,3 +296,35 @@ def test_bgmv_expand_nslices(
         device=device,
         add_inputs=True,
     )
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("op_type", ["shrink", "expand"])
+@pytest.mark.skipif(not current_platform.is_xpu(), reason="skip for non xpu platform")
+def test_bgmv_no_lora_flag(device: str, op_type: str):
+    """The no-LoRA flag has to be read at call time, not at trace time.
+
+    Every wrapped layer calls these ops on every forward pass, so a batch where
+    no request carries an adapter must leave the output untouched instead of
+    running a GEMM against an all -1 mapping - and the very next call, with the
+    flag cleared, must still compute.
+    """
+    data: PunicaTensors = generate_data(
+        4, 2049, 4, 32, 1, torch.float16, op_type, device
+    )
+    op = bgmv_shrink if op_type == "shrink" else bgmv_expand
+    args = (
+        data.inputs_tensor,
+        data.lora_weights,
+        data.our_out_tensor,
+        data.token_lora_mapping,
+    )
+    no_lora_flag_cpu = torch.tensor([True], dtype=torch.bool, device="cpu")
+
+    untouched = data.our_out_tensor.clone()
+    op(*args, no_lora_flag_cpu=no_lora_flag_cpu)
+    assert torch.equal(data.our_out_tensor, untouched)
+
+    no_lora_flag_cpu[0] = False
+    op(*args, no_lora_flag_cpu=no_lora_flag_cpu)
+    assert not torch.equal(data.our_out_tensor, untouched)

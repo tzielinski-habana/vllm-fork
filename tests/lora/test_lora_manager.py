@@ -819,6 +819,61 @@ def test_lru_cache_worker_adapter_manager(dist_init, dummy_model, device, tmp_pa
 
 
 @pytest.mark.parametrize("device", DEVICES)
+def test_lru_cache_worker_adapter_manager_load_inplace_reloads_once(
+    dist_init, dummy_model, device, tmp_path, monkeypatch
+):
+    """`load_inplace` must reload on the add_adapter() call, not on every batch.
+
+    Requests keep carrying the flag once the adapter is registered, and
+    scheduling them re-activates the adapter on every step, so honoring it there
+    would re-read the adapter from disk for the whole life of the request.
+    """
+    lora_config = LoRAConfig(
+        max_lora_rank=8, max_cpu_loras=4, max_loras=4, lora_dtype=DEFAULT_DTYPE
+    )
+    dummy_lora_files = f"{tmp_path}/lora_adapter"
+    os.makedirs(dummy_lora_files, exist_ok=True)
+    create_peft_lora(
+        dummy_model,
+        save_dir=dummy_lora_files,
+        target_modules=["layer1.dense1", "dense2"],
+        lora_dtype=DEFAULT_DTYPE,
+    )
+
+    vllm_config = VllmConfig(
+        model_config=ModelConfig(max_model_len=16), lora_config=lora_config
+    )
+    vllm_config.scheduler_config.max_num_seqs = 4
+    vllm_config.scheduler_config.max_num_batched_tokens = 2
+    worker_adapter_manager = LRUCacheWorkerLoRAManager(
+        vllm_config, device, EMBEDDING_MODULES
+    )
+    worker_adapter_manager.create_lora_manager(dummy_model, vllm_config)
+
+    lora_request = LoRARequest("1", 1, dummy_lora_files, load_inplace=True)
+    assert worker_adapter_manager.add_adapter(lora_request)
+
+    loads = 0
+    load_adapter = worker_adapter_manager._load_adapter
+
+    def counting_load_adapter(request):
+        nonlocal loads
+        loads += 1
+        return load_adapter(request)
+
+    monkeypatch.setattr(worker_adapter_manager, "_load_adapter", counting_load_adapter)
+
+    for _ in range(3):
+        worker_adapter_manager.set_active_adapters([lora_request], LoRAMapping([], []))
+    assert loads == 0
+    assert worker_adapter_manager.list_adapters() == {1}
+
+    # An explicit registration still honors the flag and picks up new weights.
+    assert worker_adapter_manager.add_adapter(lora_request)
+    assert loads == 1
+
+
+@pytest.mark.parametrize("device", DEVICES)
 def test_worker_adapter_manager(dist_init, dummy_model_gate_up, device, tmp_path):
     # Should remove every LoRA not specified in the request.
     lora_config = LoRAConfig(

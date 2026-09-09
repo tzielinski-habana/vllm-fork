@@ -869,6 +869,10 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
             "init_weight_transfer_engine", kwargs={"init_info": init_info_dict}
         )
 
+    def close_weight_transfer_engine(self) -> None:
+        """Release the transfer group the trainer set up, keeping the engine."""
+        self.llm_engine.collective_rpc("close_weight_transfer_engine")
+
     def start_weight_update(self) -> None:
         """Start a new weight update."""
         self.llm_engine.collective_rpc("start_weight_update")

@@ -1343,6 +1343,19 @@ class Worker(WorkerBase):
         typed_init_info = self.weight_transfer_engine.parse_init_info(init_info)
         self.weight_transfer_engine.init_transfer_engine(typed_init_info)
 
+    def close_weight_transfer_engine(self) -> None:
+        """
+        Release the trainer-facing side of the transfer, keeping the engine.
+
+        Lets a trainer that is done detach cleanly: transports that do not tear
+        down independently on each side block the trainer until the workers drop
+        the group too. A later trainer can call init_weight_transfer_engine
+        again.
+        """
+        self._check_weight_transfer_engine()
+        assert self.weight_transfer_engine is not None
+        self.weight_transfer_engine.shutdown()
+
     def start_weight_update(self) -> None:
         """
         Start a new weight update session.

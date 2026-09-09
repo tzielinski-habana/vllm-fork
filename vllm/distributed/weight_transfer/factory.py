@@ -240,6 +240,12 @@ WeightTransferEngineFactory.register_engine(
     "ShardedRDTWeightTransferEngine",
 )
 
+WeightTransferEngineFactory.register_engine(
+    "torch_dist",
+    "vllm.distributed.weight_transfer.torch_dist_engine",
+    "TorchDistWeightTransferEngine",
+)
+
 
 # Trainer-side engines, parallel to the worker registry above.
 WeightTransferTrainerFactory.register_engine(
@@ -264,4 +270,10 @@ WeightTransferTrainerFactory.register_engine(
     "sharded_rdt",
     "vllm.distributed.weight_transfer.sharded_rdt_trainer",
     "ShardedRDTTrainerWeightTransferEngine",
+)
+
+WeightTransferTrainerFactory.register_engine(
+    "torch_dist",
+    "vllm.distributed.weight_transfer.torch_dist_engine",
+    "TorchDistTrainerWeightTransferEngine",
 )

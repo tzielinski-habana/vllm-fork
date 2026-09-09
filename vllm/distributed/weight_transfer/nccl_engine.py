@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """NCCL-based (dense) weight transfer engine."""
 
-from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, ClassVar
@@ -23,6 +22,7 @@ from vllm.distributed.weight_transfer.base import (
     WeightSource,
     WeightTransferEngine,
     WeightTransferUpdateInfo,
+    checked_iter,
 )
 from vllm.distributed.weight_transfer.nccl_common import (
     NCCLWeightTransferInitInfo,
@@ -374,7 +374,7 @@ class NCCLTrainerWeightTransferEngine(TrainerWeightTransferEngine[NCCLTrainerIni
         assert self.model_update_group is not None, (
             "trainer_init() must be called before _broadcast()."
         )
-        pairs = self._checked_iter(source, meta)
+        pairs = checked_iter(source, meta)
         if self.packed:
             packed_nccl_broadcast_producer(
                 iterator=pairs,
@@ -393,49 +393,6 @@ class NCCLTrainerWeightTransferEngine(TrainerWeightTransferEngine[NCCLTrainerIni
                 # enqueued. (The packed path linearizes in `pack_tensors`.)
                 send = tensor if tensor.is_contiguous() else tensor.contiguous()
                 self.model_update_group.broadcast(send, src=0, stream=stream)
-
-    @staticmethod
-    def _checked_iter(
-        source: WeightSource, meta: list[ParamMeta]
-    ) -> Iterator[tuple[str, torch.Tensor]]:
-        """Yield the source's pairs, checking each against what the worker was
-        told to expect.
-
-        The worker sizes its receive buffers — and in packed mode cuts its chunk
-        boundaries — from the update info, which is built from `metadata()`. If
-        iteration disagrees with it, the two sides split the stream differently
-        and the transfer hangs in NCCL or loads garbage. Checking here costs one
-        comparison per parameter and turns that into an error naming the first
-        divergent parameter. Sender-only: under pipeline parallelism a
-        non-sender's yielded tensor is not meaningful.
-        """
-        sent = 0
-        for name, tensor in source:
-            if sent >= len(meta):
-                raise ValueError(
-                    f"WeightSource yielded more parameters than metadata() "
-                    f"declared ({len(meta)}); first extra is {name!r}."
-                )
-            expected = meta[sent]
-            if (
-                name != expected.name
-                or tensor.dtype != expected.dtype
-                or tuple(tensor.shape) != expected.shape
-            ):
-                raise ValueError(
-                    "WeightSource metadata() disagrees with iteration at index "
-                    f"{sent}: declared {expected.name!r} "
-                    f"{expected.dtype} {tuple(expected.shape)}, got {name!r} "
-                    f"{tensor.dtype} {tuple(tensor.shape)}. Both channels must "
-                    "enumerate the same parameters in the same order."
-                )
-            sent += 1
-            yield name, tensor
-        if sent != len(meta):
-            raise ValueError(
-                f"WeightSource yielded {sent} parameters but metadata() "
-                f"declared {len(meta)}; the worker is waiting for the rest."
-            )
 
     def _post_send_sync(self) -> None:
         """Wait for this rank's transfer work to land before returning.

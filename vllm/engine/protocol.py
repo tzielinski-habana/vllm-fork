@@ -273,6 +273,10 @@ class EngineClient(ABC):
         """Initialize weight transfer for RL training."""
         raise NotImplementedError
 
+    async def close_weight_transfer_engine(self) -> None:
+        """Release the transfer group the trainer set up, keeping the engine."""
+        raise NotImplementedError
+
     async def start_weight_update(self) -> None:
         """Start a new weight update."""
         raise NotImplementedError

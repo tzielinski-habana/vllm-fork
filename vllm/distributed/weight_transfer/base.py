@@ -263,6 +263,49 @@ class ModuleSource(WeightSource):
             yield name, materialize_full_tensor(param)
 
 
+def checked_iter(
+    source: WeightSource, meta: list[ParamMeta]
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Yield the source's pairs, checking each against what the worker was told
+    to expect.
+
+    The worker sizes its receive buffers — and in packed mode cuts its chunk
+    boundaries — from the update info, which is built from `metadata()`. If
+    iteration disagrees with it, the two sides split the stream differently and
+    the transfer hangs in a collective or loads garbage. Checking here costs one
+    comparison per parameter and turns that into an error naming the first
+    divergent parameter. Sender-only: under pipeline parallelism a non-sender's
+    yielded tensor is not meaningful.
+    """
+    sent = 0
+    for name, tensor in source:
+        if sent >= len(meta):
+            raise ValueError(
+                f"WeightSource yielded more parameters than metadata() "
+                f"declared ({len(meta)}); first extra is {name!r}."
+            )
+        expected = meta[sent]
+        if (
+            name != expected.name
+            or tensor.dtype != expected.dtype
+            or tuple(tensor.shape) != expected.shape
+        ):
+            raise ValueError(
+                "WeightSource metadata() disagrees with iteration at index "
+                f"{sent}: declared {expected.name!r} "
+                f"{expected.dtype} {tuple(expected.shape)}, got {name!r} "
+                f"{tensor.dtype} {tuple(tensor.shape)}. Both channels must "
+                "enumerate the same parameters in the same order."
+            )
+        sent += 1
+        yield name, tensor
+    if sent != len(meta):
+        raise ValueError(
+            f"WeightSource yielded {sent} parameters but metadata() "
+            f"declared {len(meta)}; the worker is waiting for the rest."
+        )
+
+
 # Base protocols for backend-specific dataclasses
 @dataclass
 class WeightTransferInitInfo(ABC):  # noqa: B024
@@ -549,6 +592,21 @@ class VLLMWeightSyncClient(Protocol):
     def update_weights(self, update_info: WeightTransferUpdatePayload) -> None: ...
 
     def finish_weight_update(self, weight_version: str | None = None) -> None: ...
+
+
+@runtime_checkable
+class SupportsWeightTransferClose(Protocol):
+    """Optional client capability: releasing the inference side of the transfer.
+
+    Backends whose transport tears down independently on each side do not need
+    this. It exists for the ones that do not: a trainer leaving a group that the
+    workers still hold can block in the transport's finalization until they let
+    go, and the four control-plane calls give it no way to ask. Engines should
+    treat it as optional (`isinstance` check) so clients predating it keep
+    working.
+    """
+
+    def close_weight_transfer_engine(self) -> None: ...
 
 
 class TrainerWeightTransferEngine(ABC, Generic[TTrainerInitInfo]):

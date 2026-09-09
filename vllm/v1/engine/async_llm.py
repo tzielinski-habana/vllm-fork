@@ -1220,6 +1220,10 @@ class AsyncLLM(EngineClient):
             "init_weight_transfer_engine", kwargs={"init_info": request.init_info}
         )
 
+    async def close_weight_transfer_engine(self) -> None:
+        """Release the transfer group the trainer set up, keeping the engine."""
+        await self.collective_rpc("close_weight_transfer_engine")
+
     async def start_weight_update(self) -> None:
         """Start a new weight update."""
         await self.collective_rpc("start_weight_update")

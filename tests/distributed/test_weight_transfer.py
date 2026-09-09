@@ -30,6 +30,7 @@ from vllm.distributed.weight_transfer import (
     WeightSource,
     WeightTransferEngineFactory,
     WeightTransferTrainerFactory,
+    torch_dist_engine,
 )
 from vllm.distributed.weight_transfer.base import (
     TrainerInitInfo,
@@ -62,6 +63,11 @@ from vllm.distributed.weight_transfer.sparse_nccl_engine import (
     SparseNCCLWeightTransferEngine,
     SparseNCCLWeightTransferUpdateInfo,
     SparseWeightPatch,
+)
+from vllm.distributed.weight_transfer.torch_dist_engine import (
+    TorchDistTrainerWeightTransferEngine,
+    TorchDistWeightTransferEngine,
+    TorchDistWeightTransferInitInfo,
 )
 from vllm.platforms import current_platform
 from vllm.utils.network_utils import get_open_port
@@ -360,6 +366,113 @@ def test_sparse_nccl_receive_weights_without_init_raises():
 
     with pytest.raises(RuntimeError, match="not initialized"):
         engine.receive_weights(update_info)
+
+
+# --- Unit Tests: torch.distributed Backend Group Lifecycle ---
+
+
+class _ClientWithoutClose:
+    """A client implementing only the four required control-plane calls."""
+
+    def init_weight_transfer_engine(self, init_info: dict) -> None:
+        pass
+
+    def start_weight_update(self) -> None:
+        pass
+
+    def update_weights(self, update_info: dict) -> None:
+        pass
+
+    def finish_weight_update(self, weight_version: str | None = None) -> None:
+        pass
+
+
+class _ClosingClient(_ClientWithoutClose):
+    """A client that also implements the optional close capability."""
+
+    def __init__(self, order: list[str]):
+        self.order = order
+
+    def close_weight_transfer_engine(self) -> None:
+        self.order.append("client")
+
+
+class TestTorchDistGroupLifecycle:
+    """The `torch_dist` group has to survive a trainer coming and going.
+
+    Its transport is only reachable through `torch.distributed`, so both tests
+    stub the group plumbing out: what matters here is the ordering of release
+    against join, which is what a reconnecting trainer depends on.
+    """
+
+    def _make_worker_engine(self):
+        return TorchDistWeightTransferEngine(
+            WeightTransferConfig(backend="torch_dist"),
+            create_mock_vllm_config(),
+            torch.device("cpu"),
+            MagicMock(spec=torch.nn.Module),
+        )
+
+    def _init_info(self):
+        return TorchDistWeightTransferInitInfo(
+            master_address="127.0.0.1",
+            master_port=12345,
+            rank_offset=1,
+            world_size=2,
+        )
+
+    def test_reinit_releases_the_previous_group(self, monkeypatch):
+        """A second trainer must not find the first one's group still joined.
+
+        It would keep the rendezvous port connected, and the new trainer could
+        not bind its store.
+        """
+        engine = self._make_worker_engine()
+        stale, fresh = MagicMock(name="stale"), MagicMock(name="fresh")
+        released: list[MagicMock] = []
+
+        monkeypatch.setattr(
+            torch_dist_engine, "_release_transfer_group", released.append
+        )
+        monkeypatch.setattr(
+            torch_dist_engine, "_init_transfer_group", lambda *a, **kw: fresh
+        )
+
+        engine.model_update_group = stale
+        engine.init_transfer_engine(self._init_info())
+
+        assert released == [stale]
+        assert engine.model_update_group is fresh
+
+    def test_trainer_shutdown_closes_the_inference_side_first(self, monkeypatch):
+        """The workers have to leave before this side drops the group.
+
+        Transports that finalize collectively block the trainer otherwise.
+        """
+        order: list[str] = []
+        monkeypatch.setattr(
+            torch_dist_engine,
+            "_release_transfer_group",
+            lambda pg: order.append("local"),
+        )
+
+        engine = TorchDistTrainerWeightTransferEngine(client=_ClosingClient(order))
+        engine.model_update_group = MagicMock()
+        engine.shutdown()
+
+        assert order == ["client", "local"]
+
+    def test_trainer_shutdown_tolerates_a_client_that_cannot_close(self, monkeypatch):
+        """Closing is optional, so a four-method client must still shut down."""
+        monkeypatch.setattr(
+            torch_dist_engine, "_release_transfer_group", lambda pg: None
+        )
+
+        engine = TorchDistTrainerWeightTransferEngine(client=_ClientWithoutClose())
+        engine.model_update_group = MagicMock()
+        engine.shutdown()
+
+        assert engine.model_update_group is None
 
 
 # --- Integration Test: NCCL Weight Transfer Between Ray Tasks ---

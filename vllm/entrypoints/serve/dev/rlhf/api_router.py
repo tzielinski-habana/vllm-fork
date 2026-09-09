@@ -172,6 +172,12 @@ async def init_weight_transfer_engine(raw_request: Request):
     return JSONResponse(content={"message": "Weight transfer initialized"})
 
 
+@router.post("/close_weight_transfer_engine")
+async def close_weight_transfer_engine(raw_request: Request):
+    await engine_client(raw_request).close_weight_transfer_engine()
+    return JSONResponse(content={"message": "Weight transfer closed"})
+
+
 @router.post("/start_weight_update")
 async def start_weight_update(raw_request: Request):
     await engine_client(raw_request).start_weight_update()

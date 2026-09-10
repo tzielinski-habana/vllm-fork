@@ -186,10 +186,19 @@ class TestRejectDisabledCommunicator:
     nothing, so both rendezvous helpers have to reject such a communicator.
 
     `world_size=1` is the reason that needs no NCCL library and no accelerator to
-    trigger, so these run anywhere.
+    trigger, so these run anywhere. They do pin the platform to a CUDA-alike one,
+    since that is what selects `PyNcclCommunicator` at all (elsewhere the
+    rendezvous goes over `torch.distributed`), and the pin is also what keeps the
+    assertion meaningful on a non-CUDA host.
     """
 
-    def test_stateless_init_rejects_disabled(self):
+    @pytest.fixture
+    def cuda_alike(self, monkeypatch: pytest.MonkeyPatch):
+        from vllm.platforms import current_platform
+
+        monkeypatch.setattr(current_platform, "is_cuda_alike", lambda: True)
+
+    def test_stateless_init_rejects_disabled(self, cuda_alike):
         from vllm.distributed.weight_transfer.nccl_common import (
             stateless_init_process_group,
         )
@@ -204,7 +213,7 @@ class TestRejectDisabledCommunicator:
                 device=0,
             )
 
-    def test_uid_init_rejects_disabled(self):
+    def test_uid_init_rejects_disabled(self, cuda_alike):
         from vllm.distributed.weight_transfer.nccl_common import uid_init_process_group
 
         with pytest.raises(RuntimeError, match="disabled itself"):

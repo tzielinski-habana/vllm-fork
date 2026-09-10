@@ -177,6 +177,50 @@ class TestNCCLRendezvousValidation:
             )
 
 
+class TestRejectDisabledCommunicator:
+    """A `PyNcclCommunicator` that disabled itself must not be handed out.
+
+    `PyNcclCommunicator` degrades to a no-op rather than raising when it cannot
+    talk NCCL, and each collective early-returns on `disabled`. For weight
+    transfer that means a whole update round reports success while transferring
+    nothing, so both rendezvous helpers have to reject such a communicator.
+
+    `world_size=1` is the reason that needs no NCCL library and no accelerator to
+    trigger, so these run anywhere.
+    """
+
+    def test_stateless_init_rejects_disabled(self):
+        from vllm.distributed.weight_transfer.nccl_common import (
+            stateless_init_process_group,
+        )
+        from vllm.utils.network_utils import get_open_port
+
+        with pytest.raises(RuntimeError, match="disabled itself"):
+            stateless_init_process_group(
+                "127.0.0.1",
+                get_open_port(),
+                rank=0,
+                world_size=1,
+                device=0,
+            )
+
+    def test_uid_init_rejects_disabled(self):
+        from vllm.distributed.weight_transfer.nccl_common import uid_init_process_group
+
+        with pytest.raises(RuntimeError, match="disabled itself"):
+            uid_init_process_group(b"\x00" * 128, rank=0, world_size=1, device=0)
+
+    def test_usable_communicator_passes_through(self):
+        from vllm.distributed.weight_transfer.nccl_common import (
+            _require_usable_communicator,
+        )
+
+        comm = MagicMock()
+        comm.disabled = False
+        comm.available = True
+        assert _require_usable_communicator(comm) is comm
+
+
 @ray.remote(num_gpus=1)
 def inference_receive_tensor(
     init_info_dict: dict,

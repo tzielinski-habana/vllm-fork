@@ -257,7 +257,7 @@ class NCCLTrainerWeightTransferEngine(TrainerWeightTransferEngine[NCCLTrainerIni
         self,
         *,
         client: VLLMWeightSyncClient,
-        source: WeightSource,
+        source: WeightSource | None = None,
         is_sender: bool = True,
         packed: bool = True,
         packed_buffer_size_bytes: int = DEFAULT_PACKED_BUFFER_SIZE_BYTES,
@@ -277,8 +277,6 @@ class NCCLTrainerWeightTransferEngine(TrainerWeightTransferEngine[NCCLTrainerIni
         client: VLLMWeightSyncClient,
         source: WeightSource | None = None,
     ) -> Self:
-        if source is None:
-            raise ValueError("NCCL trainer weight transfer requires a WeightSource.")
         engine = cls(
             client=client,
             source=source,
@@ -317,9 +315,30 @@ class NCCLTrainerWeightTransferEngine(TrainerWeightTransferEngine[NCCLTrainerIni
 
         return engine
 
-    def send_weights(self) -> None:
-        assert self.source is not None  # guaranteed by trainer_init / __init__
-        source = self.source
+    def send_weights(
+        self,
+        source: WeightSource | None = None,
+        *,
+        drive_lifecycle: bool = True,
+    ) -> None:
+        """Push one full set of weights to the inference workers.
+
+        Args:
+            source: Weights to send this round, overriding the source given at
+                `trainer_init`. Lets a caller that produces a fresh stream per
+                round hand it over at send time instead of holding a re-iterable
+                source.
+            drive_lifecycle: Whether to bracket the transfer with
+                `start_weight_update`/`finish_weight_update`. Pass `False` when
+                the caller already opened the update to group several sends into
+                one reload.
+        """
+        source = source or self.source
+        if source is None:
+            raise ValueError(
+                "NCCL trainer weight transfer requires a WeightSource, either "
+                "at trainer_init() or at send_weights()."
+            )
 
         # Metadata is declared without gathering. For Megatron it is itself a
         # collective, so every rank runs it; only the sender ships it.
@@ -337,7 +356,8 @@ class NCCLTrainerWeightTransferEngine(TrainerWeightTransferEngine[NCCLTrainerIni
             shapes=[list(m.shape) for m in meta],
         )
 
-        self.client.start_weight_update()
+        if drive_lifecycle:
+            self.client.start_weight_update()
         # update_weights (workers receive) must run concurrently with the
         # trainer-side broadcast — both rendezvous inside the same NCCL calls.
         exe = ThreadPoolExecutor(max_workers=1)
@@ -359,7 +379,8 @@ class NCCLTrainerWeightTransferEngine(TrainerWeightTransferEngine[NCCLTrainerIni
             # thread is still joined at interpreter exit, so a caller that wants
             # to exit cleanly after such a failure must not wait on it.)
             exe.shutdown(wait=False)
-        self.client.finish_weight_update()
+        if drive_lifecycle:
+            self.client.finish_weight_update()
         self._post_send_sync()
 
     def _broadcast(self, source: WeightSource, meta: list[ParamMeta]) -> None:

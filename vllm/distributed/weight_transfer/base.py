@@ -616,10 +616,11 @@ class TrainerWeightTransferEngine(ABC, Generic[TTrainerInitInfo]):
     Constructed via the `trainer_init` factory classmethod; carries any
     backend-specific state (NCCL communicators, IPC device info, transfer
     plans) on `self`. Full-resync backends (NCCL, IPC) take a `WeightSource` at
-    `trainer_init` and replay it each round via the no-argument
-    `send_weights()`. Backends that push per-round deltas instead (e.g. sparse
-    patches) leave `source` as `None` and take their payload as a `send_weights`
-    argument.
+    `trainer_init` and replay it each round via `send_weights()`; a caller whose
+    source can only be iterated once may instead hand a fresh one to each
+    `send_weights()` call. Backends that push per-round deltas instead (e.g.
+    sparse patches) leave `source` as `None` and take their payload as a
+    `send_weights` argument.
 
     Unlike the worker engine, the trainer side does not take a
     `WeightTransferConfig`: the backend is selected from the init info's

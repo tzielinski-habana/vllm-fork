@@ -1831,15 +1831,38 @@ def _mock_group_engine(source, monkeypatch, **kwargs):
     return engine
 
 
-def test_nccl_trainer_init_requires_source():
-    """NCCL is a full-resync backend: it cannot run without a WeightSource."""
+def test_nccl_trainer_send_weights_requires_source(monkeypatch):
+    """NCCL is a full-resync backend: it cannot send without a WeightSource,
+    from `trainer_init` or from the `send_weights` call itself."""
+    engine = _mock_group_engine(None, monkeypatch)
+
     with pytest.raises(ValueError, match="requires a WeightSource"):
-        NCCLTrainerWeightTransferEngine.trainer_init(
-            NCCLTrainerInitInfo(
-                master_address="127.0.0.1", master_port=29500, world_size=2, rank=0
-            ),
-            client=RecordingClient(),
-        )
+        engine.send_weights()
+
+
+def test_nccl_trainer_send_weights_takes_per_round_source(monkeypatch):
+    """A trainer whose source can only be iterated once (parameter gathering is
+    a collective) hands a fresh one to each round instead of holding it."""
+    meta = [ParamMeta("w", torch.float32, (4,))]
+    engine = _mock_group_engine(None, monkeypatch)
+
+    engine.send_weights(_ScriptedSource(meta, [("w", torch.zeros(4))]))
+
+    assert engine.client.order == ["start", "update", "finish"]
+    assert engine.client.last_update_info["names"] == ["w"]
+
+
+def test_nccl_trainer_send_weights_without_lifecycle(monkeypatch):
+    """`drive_lifecycle=False` lets a caller that already opened the update group
+    several sends into one reload, so the engine must not bracket its own."""
+    meta = [ParamMeta("w", torch.float32, (4,))]
+    engine = _mock_group_engine(
+        _ScriptedSource(meta, [("w", torch.zeros(4))]), monkeypatch
+    )
+
+    engine.send_weights(drive_lifecycle=False)
+
+    assert engine.client.order == ["update"]
 
 
 def test_nccl_trainer_send_weights_rejects_reordered_source(monkeypatch):
